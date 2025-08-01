@@ -85,7 +85,6 @@ cp .env.example .env
 ```
 
 Required environment variables:
-```bash
 Twitter/X API
 ```bash
 TWITTER_BEARER_TOKEN=your_twitter_bearer_token
