@@ -87,10 +87,15 @@ cp .env.example .env
 Required environment variables:
 ```bash
 Twitter/X API
+```bash
 TWITTER_BEARER_TOKEN=your_twitter_bearer_token
+```
 Reddit API
+```bash
 REDDIT_CLIENT_ID=your_reddit_client_id REDDIT_CLIENT_SECRET=your_reddit_client_secret REDDIT_USER_AGENT=SentimentTracker/1.0
+```
 LLM APIs (at least one required)
+```bash
 OPENAI_API_KEY=your_openai_api_key HUGGINGFACE_API_KEY=your_huggingface_api_key
 ```
 
@@ -155,7 +160,7 @@ Create virtual environment
 ```bash
 python -m venv venv
 source venv/bin/activate  # or `venv\Scripts\activate` on Windows
-
+```
 Install dependencies
 ```bash
 pip install -r requirements.txt
