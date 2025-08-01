@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # The ingestor service to pull data from social media
+  ingestor:
+    build: .
+    command: python ingestor/ingestor.py
+    environment:
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+    depends_on:
+      - redis
+    restart: on-failure
+
+  # The worker service to process messages and run LLM inference
+  worker:
+    build: .
+    command: python worker/worker.py
+    environment:
+      - GOOGLE_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      - redis
+    restart: on-failure
+
+  # The Streamlit dashboard service for visualization
+  dashboard:
+    build: .
+    command: streamlit run dashboard/dashboard.py --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    depends_on:
+      - redis
