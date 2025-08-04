@@ -1,38 +1,43 @@
-version: '3.8'
-
+version: "3.8"
 services:
-  redis:
-    image: redis:6.2-alpine
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: sentiment_rabbitinq
+    environmen:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEAFULT_PASS: password
     ports:
-      - "6379:6379"
-    restart: always
+      - "5672.5672"
+      - "15672.15672"
+    volumes:
+      -rabbitmq_data:/var/lib/rabbitmq
+    healthchech:
+      test: ["CMD","rabbitmqct1","status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # The ingestor service to pull data from social media
+  redis:
+    image: redis:7-alpine
+    container_name: sentiment_redis
+    ports:
+      - "6379.6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD','redis-cli','ping']
+      interval:  30s
+      timeout:  10s
+      retries:  3
   ingestor:
     build: .
-    command: python ingestor/ingestor.py
+    container_name: sentiment_ingestor
     environment:
+      - RABBITMQ_URL=amgq://admin:password@rabbitmq:5672/
+      - REDIS_URL=redis://redis:6379/0
+      - TWITTER_BEARER_TOKEN=${TWITTER_BEARER_TOKEN}
       - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
       - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
-    depends_on:
-      - redis
-    restart: on-failure
-
-  # The worker service to process messages and run LLM inference
-  worker:
-    build: .
-    command: python worker/worker.py
-    environment:
-      - GOOGLE_API_KEY=${GEMINI_API_KEY}
-    depends_on:
-      - redis
-    restart: on-failure
-
-  # The Streamlit dashboard service for visualization
-  dashboard:
-    build: .
-    command: streamlit run dashboard/dashboard.py --server.address=0.0.0.0
-    ports:
-      - "8501:8501"
-    depends_on:
-      - redis
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
+    command: python ingestor/ingestor.py
+    
