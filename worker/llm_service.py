@@ -1,352 +1,345 @@
-#!/usr/bin/env python3
 """
-LLM Service Module for Sentiment Analysis
+LLM Sentiment Analysis Service
 
-This module provides an abstraction layer for interacting with Google's Gemini API
-to perform sentiment analysis on social media posts. It handles API authentication,
-prompt construction, response parsing, and error handling.
-
-The service is designed to be:
-- Robust: Handles API errors and rate limits gracefully
-- Efficient: Uses optimized prompts for quick, accurate results  
-- Scalable: Can be easily extended to support other LLM providers
-- Reliable: Includes retry logic and fallback responses
-
-Author: Your Name
-Date: 2024
+This module provides sentiment analysis capabilities using various LLM providers
+including OpenAI GPT models and Hugging Face transformers.
 """
 
-import os
-import time
+import json
 import logging
-import google.generativeai as genai
-from typing import Dict, Optional, Tuple
-from dotenv import load_dotenv
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Union
+import asyncio
 
-# Load environment variables
-load_dotenv()
+import openai
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+import torch
+from pydantic import BaseModel
+import structlog
 
-# Configure logging
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
-class SentimentAnalyzer:
-    """
-    A service class that handles sentiment analysis using Google's Gemini API.
+
+class SentimentLabel(str, Enum):
+    """Sentiment classification labels"""
+    POSITIVE = "positive"
+    NEGATIVE = "negative"
+    NEUTRAL = "neutral"
+
+
+@dataclass
+class SentimentResult:
+    """Sentiment analysis result"""
+    label: SentimentLabel
+    confidence: float
+    reasoning: Optional[str] = None
+    processing_time: float = 0.0
+    model_used: str = ""
+
+
+class BaseLLMProvider(ABC):
+    """Abstract base class for LLM sentiment analysis providers"""
     
-    This class encapsulates all the logic needed to:
-    1. Authenticate with the Gemini API
-    2. Construct effective prompts for sentiment analysis
-    3. Parse and validate API responses
-    4. Handle errors and rate limits gracefully
-    """
+    @abstractmethod
+    async def analyze_sentiment(self, text: str) -> SentimentResult:
+        """Analyze sentiment of given text"""
+        pass
     
-    def __init__(self):
-        """
-        Initialize the sentiment analyzer with API credentials and configuration.
-        
-        Sets up the Gemini API client and validates credentials.
-        """
-        self.api_key = os.getenv('GEMINI_API_KEY')
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required")
-        
-        # Configure the Gemini API
-        genai.configure(api_key=self.api_key)
-        
-        # Initialize the model
-        # Using gemini-pro for general text tasks
-        self.model = genai.GenerativeModel('gemini-pro')
-        
-        # Configuration for generation
-        self.generation_config = {
-            'temperature': 0.1,  # Low temperature for consistent, focused responses
-            'top_p': 0.8,
-            'top_k': 40,
-            'max_output_tokens': 100,  # Keep responses short and focused
-        }
-        
-        logger.info("Sentiment Analyzer initialized with Gemini API")
+    @abstractmethod
+    def get_provider_name(self) -> str:
+        """Get provider name"""
+        pass
+
+
+class OpenAIProvider(BaseLLMProvider):
+    """OpenAI GPT-based sentiment analysis"""
     
-    def _construct_prompt(self, text: str) -> str:
-        """
-        Construct an optimized prompt for sentiment analysis.
+    def __init__(self, api_key: str, model: str = "gpt-3.5-turbo"):
+        self.client = openai.AsyncOpenAI(api_key=api_key)
+        self.model = model
         
-        The prompt is carefully designed to:
-        - Get consistent, parseable responses
-        - Minimize token usage for cost efficiency
-        - Provide clear instructions for the model
-        - Handle edge cases and ambiguous text
-        
-        Args:
-            text (str): The text to analyze for sentiment
-            
-        Returns:
-            str: A well-structured prompt for the LLM
-        """
-        # Clean and prepare the input text
-        cleaned_text = text.strip()[:800]  # Limit text length
-        
-        prompt = f"""Analyze the sentiment of this social media post and respond with ONLY the requested format.
-
-Post: "{cleaned_text}"
-
-Respond with exactly this format:
-SENTIMENT: [positive/negative/neutral]
-CONFIDENCE: [0-100]
-REASON: [brief explanation in 10 words or less]
-
-Rules:
-- positive: optimistic, happy, excited, supportive content
-- negative: angry, sad, frustrated, critical, pessimistic content  
-- neutral: informational, questions, balanced, or unclear sentiment
-- confidence: how certain you are (0=very uncertain, 100=very certain)
-- reason: key words/phrases that influenced your decision
-
-Example response:
-SENTIMENT: positive
-CONFIDENCE: 85
-REASON: enthusiastic language and positive outcomes mentioned"""
-
-        return prompt
+    def get_provider_name(self) -> str:
+        return f"openai-{self.model}"
     
-    def _parse_response(self, response_text: str) -> Dict[str, any]:
-        """
-        Parse the LLM response into structured data.
+    async def analyze_sentiment(self, text: str) -> SentimentResult:
+        """Analyze sentiment using OpenAI GPT"""
+        start_time = time.time()
         
-        This method handles the parsing of the model's response and provides
-        fallback values if the response format is unexpected.
-        
-        Args:
-            response_text (str): Raw response from the LLM
-            
-        Returns:
-            Dict: Parsed sentiment data with sentiment, confidence, and reason
-        """
         try:
-            # Initialize default values
-            result = {
-                'sentiment': 'neutral',
-                'confidence': 50,
-                'reason': 'unable to parse response'
+            # Construct the prompt for sentiment analysis
+            system_prompt = """You are an expert sentiment analyzer. Analyze the sentiment of the given text and respond with ONLY a JSON object in this exact format:
+
+{
+    "sentiment": "positive" | "negative" | "neutral",
+    "confidence": 0.0-1.0,
+    "reasoning": "brief explanation"
+}
+
+Guidelines:
+- positive: clearly expresses happiness, satisfaction, excitement, or approval
+- negative: clearly expresses dissatisfaction, anger, sadness, or disapproval  
+- neutral: factual, objective, or mixed emotions that don't lean clearly positive or negative
+- confidence: how certain you are (0.0 = not certain, 1.0 = very certain)
+- reasoning: 1-2 sentences explaining your classification"""
+
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Analyze this text: {text[:1000]}"}  # Limit text length
+                ],
+                temperature=0.1,  # Low temperature for consistent results
+                max_tokens=200
+            )
+            
+            # Parse the response
+            response_text = response.choices[0].message.content.strip()
+            
+            # Try to extract JSON from the response
+            try:
+                # Find JSON object in response
+                start_idx = response_text.find('{')
+                end_idx = response_text.rfind('}') + 1
+                if start_idx != -1 and end_idx != 0:
+                    json_str = response_text[start_idx:end_idx]
+                    result = json.loads(json_str)
+                else:
+                    raise ValueError("No JSON found in response")
+            except (json.JSONDecodeError, ValueError):
+                # Fallback parsing
+                response_lower = response_text.lower()
+                if "positive" in response_lower:
+                    sentiment = SentimentLabel.POSITIVE
+                elif "negative" in response_lower:
+                    sentiment = SentimentLabel.NEGATIVE
+                else:
+                    sentiment = SentimentLabel.NEUTRAL
+                
+                result = {
+                    "sentiment": sentiment.value,
+                    "confidence": 0.7,
+                    "reasoning": "Fallback classification based on keyword detection"
+                }
+            
+            processing_time = time.time() - start_time
+            
+            return SentimentResult(
+                label=SentimentLabel(result["sentiment"]),
+                confidence=float(result["confidence"]),
+                reasoning=result.get("reasoning", ""),
+                processing_time=processing_time,
+                model_used=self.get_provider_name()
+            )
+            
+        except Exception as e:
+            logger.error("OpenAI sentiment analysis error", error=str(e), text_length=len(text))
+            
+            # Return neutral sentiment as fallback
+            return SentimentResult(
+                label=SentimentLabel.NEUTRAL,
+                confidence=0.0,
+                reasoning=f"Error in analysis: {str(e)}",
+                processing_time=time.time() - start_time,
+                model_used=self.get_provider_name()
+            )
+
+
+class HuggingFaceProvider(BaseLLMProvider):
+    """Hugging Face transformer-based sentiment analysis"""
+    
+    def __init__(self, model_name: str = "cardiffnlp/twitter-roberta-base-sentiment-latest"):
+        self.model_name = model_name
+        self.device = 0 if torch.cuda.is_available() else -1
+        
+        try:
+            # Initialize the sentiment analysis pipeline
+            self.pipeline = pipeline(
+                "sentiment-analysis", 
+                model=model_name, 
+                device=self.device,
+                return_all_scores=True
+            )
+            logger.info("Hugging Face model loaded", model=model_name, device=self.device)
+            
+        except Exception as e:
+            logger.error("Failed to load Hugging Face model", error=str(e), model=model_name)
+            raise
+    
+    def get_provider_name(self) -> str:
+        return f"huggingface-{self.model_name.split('/')[-1]}"
+    
+    async def analyze_sentiment(self, text: str) -> SentimentResult:
+        """Analyze sentiment using Hugging Face transformers"""
+        start_time = time.time()
+        
+        try:
+            # Truncate text to model's max length (typically 512 tokens)
+            text = text[:500]  # Conservative truncation
+            
+            # Run inference
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(None, self.pipeline, text)
+            
+            # Parse results - results[0] contains all scores
+            all_scores = results[0]
+            
+            # Find the highest confidence prediction
+            best_result = max(all_scores, key=lambda x: x['score'])
+            
+            # Map model labels to our standard labels
+            label_mapping = {
+                'POSITIVE': SentimentLabel.POSITIVE,
+                'NEGATIVE': SentimentLabel.NEGATIVE,
+                'NEUTRAL': SentimentLabel.NEUTRAL,
+                'positive': SentimentLabel.POSITIVE,
+                'negative': SentimentLabel.NEGATIVE,
+                'neutral': SentimentLabel.NEUTRAL,
+                'LABEL_0': SentimentLabel.NEGATIVE,  # RoBERTa specific
+                'LABEL_1': SentimentLabel.NEUTRAL,
+                'LABEL_2': SentimentLabel.POSITIVE,
             }
             
-            # Parse line by line
-            lines = response_text.strip().split('\n')
+            raw_label = best_result['label']
+            sentiment_label = label_mapping.get(raw_label, SentimentLabel.NEUTRAL)
+            confidence = float(best_result['score'])
             
-            for line in lines:
-                line = line.strip()
-                
-                if line.startswith('SENTIMENT:'):
-                    sentiment = line.replace('SENTIMENT:', '').strip().lower()
-                    if sentiment in ['positive', 'negative', 'neutral']:
-                        result['sentiment'] = sentiment
-                
-                elif line.startswith('CONFIDENCE:'):
-                    try:
-                        confidence = int(line.replace('CONFIDENCE:', '').strip())
-                        # Ensure confidence is within valid range
-                        result['confidence'] = max(0, min(100, confidence))
-                    except ValueError:
-                        logger.warning(f"Invalid confidence value in response: {line}")
-                
-                elif line.startswith('REASON:'):
-                    reason = line.replace('REASON:', '').strip()
-                    if reason and len(reason) > 0:
-                        result['reason'] = reason[:100]  # Limit reason length
+            processing_time = time.time() - start_time
             
+            return SentimentResult(
+                label=sentiment_label,
+                confidence=confidence,
+                reasoning=f"Model prediction: {raw_label} with {confidence:.3f} confidence",
+                processing_time=processing_time,
+                model_used=self.get_provider_name()
+            )
+            
+        except Exception as e:
+            logger.error("Hugging Face sentiment analysis error", error=str(e), text_length=len(text))
+            
+            return SentimentResult(
+                label=SentimentLabel.NEUTRAL,
+                confidence=0.0,
+                reasoning=f"Error in analysis: {str(e)}",
+                processing_time=time.time() - start_time,
+                model_used=self.get_provider_name()
+            )
+
+
+class LLMSentimentService:
+    """Main service for LLM-based sentiment analysis with multiple providers"""
+    
+    def __init__(self, openai_api_key: Optional[str] = None, huggingface_api_key: Optional[str] = None):
+        self.providers: List[BaseLLMProvider] = []
+        self.primary_provider: Optional[BaseLLMProvider] = None
+        
+        # Initialize OpenAI provider
+        if openai_api_key:
+            try:
+                openai_provider = OpenAIProvider(openai_api_key)
+                self.providers.append(openai_provider)
+                if not self.primary_provider:
+                    self.primary_provider = openai_provider
+                logger.info("OpenAI provider initialized")
+            except Exception as e:
+                logger.error("Failed to initialize OpenAI provider", error=str(e))
+        
+        # Initialize Hugging Face provider
+        try:
+            hf_provider = HuggingFaceProvider()
+            self.providers.append(hf_provider)
+            if not self.primary_provider:
+                self.primary_provider = hf_provider
+            logger.info("Hugging Face provider initialized")
+        except Exception as e:
+            logger.error("Failed to initialize Hugging Face provider", error=str(e))
+        
+        if not self.providers:
+            raise ValueError("No sentiment analysis providers available")
+    
+    async def analyze_sentiment(self, text: str, provider_name: Optional[str] = None) -> SentimentResult:
+        """
+        Analyze sentiment using specified provider or primary provider
+        
+        Args:
+            text: Text to analyze
+            provider_name: Specific provider to use (optional)
+            
+        Returns:
+            SentimentResult with analysis
+        """
+        if not text or not text.strip():
+            return SentimentResult(
+                label=SentimentLabel.NEUTRAL,
+                confidence=0.0,
+                reasoning="Empty text provided",
+                processing_time=0.0,
+                model_used="none"
+            )
+        
+        # Select provider
+        provider = self.primary_provider
+        if provider_name:
+            # Find specific provider
+            for p in self.providers:
+                if provider_name in p.get_provider_name():
+                    provider = p
+                    break
+        
+        if not provider:
+            raise ValueError("No suitable provider found")
+        
+        try:
+            result = await provider.analyze_sentiment(text)
+            logger.debug("Sentiment analysis completed", 
+                        provider=provider.get_provider_name(),
+                        sentiment=result.label.value,
+                        confidence=result.confidence,
+                        processing_time=result.processing_time)
             return result
             
         except Exception as e:
-            logger.error(f"Error parsing LLM response: {str(e)}")
-            logger.debug(f"Response text was: {response_text}")
+            logger.error("Sentiment analysis failed", 
+                        provider=provider.get_provider_name(),
+                        error=str(e))
             
-            # Return safe default values
-            return {
-                'sentiment': 'neutral',
-                'confidence': 30,
-                'reason': 'parsing error occurred'
-            }
+            # Try fallback provider if available
+            for fallback_provider in self.providers:
+                if fallback_provider != provider:
+                    try:
+                        logger.info("Trying fallback provider", 
+                                   fallback=fallback_provider.get_provider_name())
+                        return await fallback_provider.analyze_sentiment(text)
+                    except Exception as fallback_error:
+                        logger.error("Fallback provider failed", 
+                                   provider=fallback_provider.get_provider_name(),
+                                   error=str(fallback_error))
+            
+            # All providers failed
+            return SentimentResult(
+                label=SentimentLabel.NEUTRAL,
+                confidence=0.0,
+                reasoning=f"All providers failed: {str(e)}",
+                processing_time=0.0,
+                model_used="error"
+            )
     
-    def analyze_sentiment(self, text: str, max_retries: int = 3) -> Dict[str, any]:
+    def get_available_providers(self) -> List[str]:
+        """Get list of available provider names"""
+        return [provider.get_provider_name() for provider in self.providers]
+    
+    async def batch_analyze(self, texts: List[str], provider_name: Optional[str] = None) -> List[SentimentResult]:
         """
-        Analyze the sentiment of given text using the Gemini API.
-        
-        This is the main public method that orchestrates the entire sentiment
-        analysis process, including error handling and retries.
+        Analyze multiple texts in batch
         
         Args:
-            text (str): Text to analyze for sentiment
-            max_retries (int): Maximum number of retry attempts
+            texts: List of texts to analyze
+            provider_name: Specific provider to use (optional)
             
         Returns:
-            Dict: Analysis results containing sentiment, confidence, and reasoning
+            List of SentimentResult objects
         """
-        if not text or not text.strip():
-            logger.warning("Empty text provided for sentiment analysis")
-            return {
-                'sentiment': 'neutral',
-                'confidence': 0,
-                'reason': 'no text provided',
-                'error': 'empty_input'
-            }
-        
-        last_error = None
-        
-        for attempt in range(max_retries):
-            try:
-                # Construct the analysis prompt
-                prompt = self._construct_prompt(text)
-                
-                # Make the API call with retry logic
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config=self.generation_config
-                )
-                
-                # Check if we got a valid response
-                if not response.text:
-                    raise ValueError("Empty response from Gemini API")
-                
-                # Parse the response
-                result = self._parse_response(response.text)
-                
-                # Add metadata about the analysis
-                result.update({
-                    'analyzed_text_length': len(text),
-                    'api_response_raw': response.text[:200],  # First 200 chars for debugging
-                    'attempt_number': attempt + 1
-                })
-                
-                logger.info(f"Sentiment analysis completed: {result['sentiment']} ({result['confidence']}%)")
-                return result
-                
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Sentiment analysis attempt {attempt + 1} failed: {str(e)}")
-                
-                # If this isn't the last retry, wait before trying again
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2  # Exponential backoff
-                    logger.info(f"Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-        
-        # If all retries failed, return error response
-        logger.error(f"All sentiment analysis attempts failed. Last error: {str(last_error)}")
-        return {
-            'sentiment': 'neutral',
-            'confidence': 0,
-            'reason': 'analysis failed - api error',
-            'error': str(last_error),
-            'analyzed_text_length': len(text) if text else 0
-        }
-    
-    def batch_analyze(self, texts: list, delay_between_calls: float = 0.5) -> list:
-        """
-        Analyze sentiment for multiple texts with rate limiting.
-        
-        This method processes multiple texts while respecting API rate limits
-        and providing progress feedback.
-        
-        Args:
-            texts (list): List of texts to analyze
-            delay_between_calls (float): Seconds to wait between API calls
-            
-        Returns:
-            list: List of sentiment analysis results
-        """
-        results = []
-        
-        logger.info(f"Starting batch sentiment analysis for {len(texts)} texts")
-        
-        for i, text in enumerate(texts):
-            try:
-                result = self.analyze_sentiment(text)
-                results.append(result)
-                
-                # Progress logging
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Processed {i + 1}/{len(texts)} texts")
-                
-                # Rate limiting delay
-                if delay_between_calls > 0 and i < len(texts) - 1:
-                    time.sleep(delay_between_calls)
-                    
-            except Exception as e:
-                logger.error(f"Error in batch processing text {i}: {str(e)}")
-                results.append({
-                    'sentiment': 'neutral',
-                    'confidence': 0,
-                    'reason': 'batch processing error',
-                    'error': str(e)
-                })
-        
-        logger.info(f"Completed batch analysis. Processed {len(results)} texts")
-        return results
-    
-    def get_sentiment_summary(self, results: list) -> Dict[str, any]:
-        """
-        Generate a summary of sentiment analysis results.
-        
-        This method provides aggregate statistics about a collection of
-        sentiment analysis results, useful for dashboard displays.
-        
-        Args:
-            results (list): List of sentiment analysis result dictionaries
-            
-        Returns:
-            Dict: Summary statistics including counts and averages
-        """
-        if not results:
-            return {
-                'total_analyzed': 0,
-                'sentiment_distribution': {'positive': 0, 'negative': 0, 'neutral': 0},
-                'average_confidence': 0,
-                'error_count': 0
-            }
-        
-        # Count sentiments
-        sentiment_counts = {'positive': 0, 'negative': 0, 'neutral': 0}
-        confidence_scores = []
-        error_count = 0
-        
-        for result in results:
-            if 'error' in result:
-                error_count += 1
-                continue
-                
-            sentiment = result.get('sentiment', 'neutral')
-            if sentiment in sentiment_counts:
-                sentiment_counts[sentiment] += 1
-            
-            confidence = result.get('confidence', 0)
-            if isinstance(confidence, (int, float)) and 0 <= confidence <= 100:
-                confidence_scores.append(confidence)
-        
-        # Calculate averages
-        avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
-        
-        return {
-            'total_analyzed': len(results),
-            'sentiment_distribution': sentiment_counts,
-            'average_confidence': round(avg_confidence, 2),
-            'error_count': error_count,
-            'success_rate': round((len(results) - error_count) / len(results) * 100, 2) if results else 0
-        }
-
-# Convenience function for easy importing
-def analyze_sentiment(text: str) -> Dict[str, any]:
-    """
-    Simple function interface for sentiment analysis.
-    
-    This function provides a simple way to analyze sentiment without
-    needing to instantiate the SentimentAnalyzer class directly.
-    
-    Args:
-        text (str): Text to analyze
-        
-    Returns:
-        Dict: Sentiment analysis result
-    """
-    analyzer = SentimentAnalyzer()
-    return analyzer.analyze_sentiment(text)
-                
+        tasks = [self.analyze_sentiment(text, provider_name) for text in texts]
+        return await asyncio.gather(*tasks)

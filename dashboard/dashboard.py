@@ -1,302 +1,479 @@
-#!/usr/bin/env python3
 """
-Real-time Social Media Sentiment Tracker - Dashboard Service
+Real-time Sentiment Analysis Dashboard
 
-This service provides a real-time web dashboard using Streamlit to visualize
-sentiment analysis results. It connects to Redis to fetch processed data
-and displays interactive charts, statistics, and recent posts.
-
-The dashboard provides:
-- Real-time sentiment distribution charts
-- Historical sentiment trends
-- Recent posts table with sentiment scores
-- System statistics and performance metrics
-- Configuration controls
-
-Author: Your Name
-Date: 2024
+Interactive dashboard built with Streamlit and Plotly for visualizing
+real-time social media sentiment analysis results.
 """
 
-import os
+import asyncio
 import json
-import logging
-import pandas as pd
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from collections import defaultdict, Counter
+
+import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
 import redis
-import streamlit as st
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from typing import Dict, List, Optional
+from pydantic_settings import BaseSettings
+import structlog
 
-# Load environment variables
-load_dotenv()
+# Configure page settings
+st.set_page_config(
+    page_title="Real-time Social Media Sentiment Tracker",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
-class SentimentDashboard:
-    """
-    A Streamlit-based dashboard for visualizing real-time sentiment analysis.
+
+class Settings(BaseSettings):
+    """Dashboard settings"""
+    redis_url: str = "redis://localhost:6379/0"
+    rabbitmq_url: str = "amqp://admin:password@localhost:5672/"
     
-    This class handles:
-    1. Redis connection and data retrieval
-    2. Data formatting and preparation
-    3. Interactive chart generation
-    4. Real-time updates and caching
-    """
+    # Dashboard configuration
+    refresh_interval: int = 5  # seconds
+    max_recent_posts: int = 50
+    default_time_range: int = 24  # hours
     
-    def __init__(self):
-        """Initialize the dashboard with Redis connection and configuration."""
-        # Load configuration
-        self.redis_host = os.getenv('REDIS_HOST', 'localhost')
-        self.redis_port = int(os.getenv('REDIS_PORT', 6379))
-        self.redis_db = int(os.getenv('REDIS_DB', 0))
-        self.max_posts_display = int(os.getenv('MAX_POSTS_DISPLAY', 100))
-        self.refresh_interval = int(os.getenv('REFRESH_INTERVAL', 5))
-        
-        # Initialize Redis connection
-        self.redis_client = self._setup_redis_connection()
-        
-        # Configure Streamlit page
-        st.set_page_config(
-            page_title="Social Media Sentiment Tracker",
-            page_icon="📊",
-            layout="wide",
-            initial_sidebar_state="expanded"
-        )
-        
-        # Custom CSS for better styling
-        self._inject_custom_css()
+    class Config:
+        env_file = ".env"
+
+
+class DashboardData:
+    """Data access layer for dashboard"""
     
-    def _setup_redis_connection(self):
-        """Create and test Redis connection."""
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+    
+    def get_recent_posts(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get recent processed posts"""
         try:
-            redis_client = redis.Redis(
-                host=self.redis_host,
-                port=self.redis_port,
-                db=self.redis_db,
-                decode_responses=True
-            )
-            redis_client.ping()
-            logger.info(f"Dashboard connected to Redis at {self.redis_host}:{self.redis_port}")
-            return redis_client
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {str(e)}")
-            st.error(f"Cannot connect to Redis: {str(e)}")
-            st.stop()
-    
-    def _inject_custom_css(self):
-        """Inject custom CSS for improved dashboard styling."""
-        st.markdown("""
-        <style>
-        .main-header {
-            font-size: 3rem;
-            font-weight: bold;
-            text-align: center;
-            color: #1f77b4;
-            margin-bottom: 2rem;
-        }
-        .metric-container {
-            background-color: #f0f2f6;
-            padding: 1rem;
-            border-radius: 0.5rem;
-            margin: 0.5rem 0;
-        }
-        .sentiment-positive {
-            color: #28a745;
-            font-weight: bold;
-        }
-        .sentiment-negative {
-            color: #dc3545;
-            font-weight: bold;
-        }
-        .sentiment-neutral {
-            color: #6c757d;
-            font-weight: bold;
-        }
-        .status-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-        .status-online {
-            background-color: #28a745;
-        }
-        .status-offline {
-            background-color: #dc3545;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-    
-    @st.cache_data(ttl=30)  # Cache for 30 seconds
-    def _get_sentiment_stats(self) -> Dict:
-        """Get current sentiment statistics from Redis."""
-        try:
-            stats = self.redis_client.hgetall('sentiment_stats')
-            if not stats:
-                return {
-                    'total_count': 0,
-                    'positive_count': 0,
-                    'negative_count': 0,
-                    'neutral_count': 0,
-                    'avg_confidence': 0,
-                    'last_updated': None
-                }
-            
-            # Convert string values to appropriate types
-            processed_stats = {}
-            for key, value in stats.items():
-                if key in ['total_count', 'positive_count', 'negative_count', 'neutral_count']:
-                    processed_stats[key] = int(value) if value else 0
-                elif key == 'avg_confidence':
-                    processed_stats[key] = float(value) if value else 0
-                else:
-                    processed_stats[key] = value
-            
-            return processed_stats
-        except Exception as e:
-            logger.error(f"Error getting sentiment stats: {str(e)}")
-            return {}
-    
-    @st.cache_data(ttl=60)  # Cache for 1 minute
-    def _get_hourly_trends(self, hours_back: int = 24) -> pd.DataFrame:
-        """Get hourly sentiment trends for the specified time period."""
-        try:
-            now = datetime.utcnow()
-            trend_data = []
-            
-            for i in range(hours_back):
-                hour = now - timedelta(hours=i)
-                hour_key = hour.strftime('%Y-%m-%d-%H')
-                
-                hourly_data = self.redis_client.hgetall(f'hourly_sentiment:{hour_key}')
-                
-                if hourly_data:
-                    trend_data.append({
-                        'hour': hour,
-                        'positive': int(hourly_data.get('positive', 0)),
-                        'negative': int(hourly_data.get('negative', 0)),
-                        'neutral': int(hourly_data.get('neutral', 0))
-                    })
-                else:
-                    trend_data.append({
-                        'hour': hour,
-                        'positive': 0,
-                        'negative': 0,
-                        'neutral': 0
-                    })
-            
-            df = pd.DataFrame(trend_data)
-            df = df.sort_values('hour')
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error getting hourly trends: {str(e)}")
-            return pd.DataFrame()
-    
-    @st.cache_data(ttl=10)  # Cache for 10 seconds
-    def _get_recent_posts(self, limit: int = None) -> List[Dict]:
-        """Get recent processed posts from Redis."""
-        try:
-            if limit is None:
-                limit = self.max_posts_display
-            
-            # Get recent posts from Redis list
-            recent_posts_raw = self.redis_client.lrange('recent_posts', 0, limit - 1)
-            
+            recent_ids = self.redis.lrange("sentiment:recent", 0, limit - 1)
             posts = []
-            for post_raw in recent_posts_raw:
-                try:
-                    post_data = json.loads(post_raw)
-                    posts.append(post_data)
-                except json.JSONDecodeError:
-                    continue
+            
+            for post_id in recent_ids:
+                post_key = f"sentiment:post:{post_id.decode()}"
+                post_data = self.redis.get(post_key)
+                
+                if post_data:
+                    post = json.loads(post_data)
+                    posts.append(post)
             
             return posts
             
         except Exception as e:
-            logger.error(f"Error getting recent posts: {str(e)}")
+            logger.error("Error fetching recent posts", error=str(e))
             return []
     
-    def _create_sentiment_distribution_chart(self, stats: Dict) -> go.Figure:
-        """Create a pie chart showing sentiment distribution."""
-        if not stats or stats.get('total_count', 0) == 0:
-            # Create empty chart
-            fig = go.Figure()
-            fig.add_annotation(
-                text="No data available",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5, xanchor='center', yanchor='middle',
-                showarrow=False, font_size=16
-            )
-            fig.update_layout(title="Sentiment Distribution")
-            return fig
-        
-        sentiments = ['Positive', 'Negative', 'Neutral']
-        values = [
-            stats.get('positive_count', 0),
-            stats.get('negative_count', 0),
-            stats.get('neutral_count', 0)
-        ]
-        colors = ['#28a745', '#dc3545', '#6c757d']
-        
-        fig = go.Figure(data=[go.Pie(
-            labels=sentiments,
-            values=values,
-            marker_colors=colors,
-            hole=0.4
-        )])
-        
-        fig.update_layout(
-            title={
-                'text': "Real-time Sentiment Distribution",
-                'x': 0.5,
-                'xanchor': 'center'
-            },
-            font=dict(size=14),
-            showlegend=True,
-            height=400
-        )
-        
-        return fig
+    def get_sentiment_stats(self, hours: int = 24) -> Dict[str, int]:
+        """Get sentiment statistics for the specified time period"""
+        try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            stats = {"positive": 0, "negative": 0, "neutral": 0}
+            
+            for sentiment in stats.keys():
+                sentiment_key = f"sentiment:label:{sentiment}"
+                count = self.redis.zcount(sentiment_key, cutoff_time.timestamp(), "+inf")
+                stats[sentiment] = count
+            
+            return stats
+            
+        except Exception as e:
+            logger.error("Error fetching sentiment stats", error=str(e))
+            return {"positive": 0, "negative": 0, "neutral": 0}
     
-    def _create_trend_chart(self, df: pd.DataFrame) -> go.Figure:
-        """Create a line chart showing sentiment trends over time."""
-        if df.empty:
-            fig = go.Figure()
-            fig.add_annotation(
-                text="No trend data available",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5, xanchor='center', yanchor='middle',
-                showarrow=False, font_size=16
+    def get_platform_stats(self, hours: int = 24) -> Dict[str, int]:
+        """Get platform statistics"""
+        try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            platforms = ["twitter", "reddit"]
+            stats = {}
+            
+            for platform in platforms:
+                platform_key = f"sentiment:platform:{platform}"
+                count = self.redis.zcount(platform_key, cutoff_time.timestamp(), "+inf")
+                stats[platform] = count
+            
+            return stats
+            
+        except Exception as e:
+            logger.error("Error fetching platform stats", error=str(e))
+            return {}
+    
+    def get_hourly_trends(self, hours: int = 24) -> Dict[str, List[Dict]]:
+        """Get hourly sentiment trends"""
+        try:
+            trends = {"positive": [], "negative": [], "neutral": []}
+            current_time = datetime.utcnow()
+            
+            for i in range(hours):
+                hour_time = current_time - timedelta(hours=i)
+                hour_key = hour_time.strftime("%Y-%m-%d:%H")
+                stats_key = f"sentiment:stats:{hour_key}"
+                
+                hour_stats = self.redis.hgetall(stats_key)
+                
+                for sentiment in trends.keys():
+                    count = int(hour_stats.get(f"sentiment:{sentiment}".encode(), 0))
+                    trends[sentiment].append({
+                        "hour": hour_time,
+                        "count": count
+                    })
+            
+            # Reverse to get chronological order
+            for sentiment in trends.keys():
+                trends[sentiment].reverse()
+            
+            return trends
+            
+        except Exception as e:
+            logger.error("Error fetching hourly trends", error=str(e))
+            return {"positive": [], "negative": [], "neutral": []}
+    
+    def get_worker_status(self) -> List[Dict[str, Any]]:
+        """Get status of all workers"""
+        try:
+            worker_keys = list(self.redis.scan_iter(match="worker:status:*"))
+            workers = []
+            
+            for key in worker_keys:
+                worker_data = self.redis.hgetall(key)
+                if worker_data:
+                    worker = {}
+                    for k, v in worker_data.items():
+                        try:
+                            # Try to parse as JSON for lists
+                            if k.decode() == 'available_providers':
+                                worker[k.decode()] = json.loads(v.decode())
+                            else:
+                                worker[k.decode()] = v.decode()
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            worker[k.decode()] = str(v)
+                    
+                    workers.append(worker)
+            
+            return workers
+            
+        except Exception as e:
+            logger.error("Error fetching worker status", error=str(e))
+            return []
+
+
+def create_sentiment_pie_chart(stats: Dict[str, int]) -> go.Figure:
+    """Create a pie chart for sentiment distribution"""
+    labels = list(stats.keys())
+    values = list(stats.values())
+    colors = {'positive': '#2E8B57', 'negative': '#DC143C', 'neutral': '#4682B4'}
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=[label.title() for label in labels],
+        values=values,
+        hole=0.4,
+        marker_colors=[colors.get(label, '#808080') for label in labels],
+        textinfo='label+percent+value',
+        textposition='outside'
+    )])
+    
+    fig.update_layout(
+        title="Sentiment Distribution",
+        font=dict(size=14),
+        showlegend=True,
+        height=400
+    )
+    
+    return fig
+
+
+def create_platform_bar_chart(stats: Dict[str, int]) -> go.Figure:
+    """Create a bar chart for platform distribution"""
+    platforms = list(stats.keys())
+    counts = list(stats.values())
+    
+    fig = go.Figure(data=[go.Bar(
+        x=[platform.title() for platform in platforms],
+        y=counts,
+        marker_color=['#1DA1F2', '#FF4500']  # Twitter blue, Reddit orange
+    )])
+    
+    fig.update_layout(
+        title="Posts by Platform",
+        xaxis_title="Platform",
+        yaxis_title="Number of Posts",
+        height=400
+    )
+    
+    return fig
+
+
+def create_sentiment_timeline(trends: Dict[str, List[Dict]]) -> go.Figure:
+    """Create a timeline chart for sentiment trends"""
+    fig = go.Figure()
+    
+    colors = {'positive': '#2E8B57', 'negative': '#DC143C', 'neutral': '#4682B4'}
+    
+    for sentiment, data in trends.items():
+        if data:  # Only add if there's data
+            hours = [item['hour'] for item in data]
+            counts = [item['count'] for item in data]
+            
+            fig.add_trace(go.Scatter(
+                x=hours,
+                y=counts,
+                mode='lines+markers',
+                name=sentiment.title(),
+                line=dict(color=colors.get(sentiment, '#808080'), width=3),
+                marker=dict(size=6)
+            ))
+    
+    fig.update_layout(
+        title="Sentiment Trends Over Time",
+        xaxis_title="Time",
+        yaxis_title="Number of Posts",
+        height=400,
+        hovermode='x unified'
+    )
+    
+    return fig
+
+
+def create_recent_posts_table(posts: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a table of recent posts"""
+    if not posts:
+        return pd.DataFrame()
+    
+    # Process posts for display
+    display_posts = []
+    for post in posts:
+        # Truncate content for display
+        content = post.get('content', '')[:100] + "..." if len(post.get('content', '')) > 100 else post.get('content', '')
+        
+        display_posts.append({
+            'Platform': post.get('platform', '').title(),
+            'Content': content,
+            'Author': post.get('author', 'Unknown'),
+            'Sentiment': post.get('sentiment_label', 'Unknown').title(),
+            'Confidence': f"{post.get('sentiment_confidence', 0):.2f}",
+            'Model': post.get('model_used', 'Unknown'),
+            'Time': post.get('processed_at', '')[:19].replace('T', ' ') if post.get('processed_at') else 'Unknown'
+        })
+    
+    return pd.DataFrame(display_posts)
+
+
+def main():
+    """Main dashboard application"""
+    # Initialize settings and data connection
+    settings = Settings()
+    
+    try:
+        redis_client = redis.from_url(settings.redis_url)
+        redis_client.ping()  # Test connection
+        data_handler = DashboardData(redis_client)
+    except Exception as e:
+        st.error(f"❌ Could not connect to Redis: {e}")
+        st.stop()
+    
+    # Dashboard header
+    st.title("📊 Real-time Social Media Sentiment Tracker")
+    st.markdown("---")
+    
+    # Sidebar configuration
+    st.sidebar.header("Configuration")
+    
+    # Time range selector
+    time_range = st.sidebar.selectbox(
+        "Time Range",
+        options=[1, 6, 12, 24, 48],
+        index=3,  # Default to 24 hours
+        format_func=lambda x: f"Last {x} hours"
+    )
+    
+    # Auto-refresh toggle
+    auto_refresh = st.sidebar.checkbox("Auto Refresh", value=True)
+    refresh_rate = st.sidebar.slider("Refresh Rate (seconds)", 5, 60, settings.refresh_interval)
+    
+    # Manual refresh button
+    if st.sidebar.button("🔄 Refresh Now"):
+        st.experimental_rerun()
+    
+    # Data fetch
+    with st.spinner("Loading data..."):
+        sentiment_stats = data_handler.get_sentiment_stats(time_range)
+        platform_stats = data_handler.get_platform_stats(time_range)
+        recent_posts = data_handler.get_recent_posts(settings.max_recent_posts)
+        hourly_trends = data_handler.get_hourly_trends(min(time_range, 24))  # Max 24 hours for trends
+        worker_status = data_handler.get_worker_status()
+    
+    # Key Metrics Row
+    col1, col2, col3, col4 = st.columns(4)
+    
+    total_posts = sum(sentiment_stats.values())
+    
+    with col1:
+        st.metric(
+            label="Total Posts",
+            value=total_posts,
+            delta=f"Last {time_range}h"
+        )
+    
+    with col2:
+        positive_pct = (sentiment_stats['positive'] / total_posts * 100) if total_posts > 0 else 0
+        st.metric(
+            label="Positive Sentiment",
+            value=f"{positive_pct:.1f}%",
+            delta=f"{sentiment_stats['positive']} posts"
+        )
+    
+    with col3:
+        negative_pct = (sentiment_stats['negative'] / total_posts * 100) if total_posts > 0 else 0
+        st.metric(
+            label="Negative Sentiment", 
+            value=f"{negative_pct:.1f}%",
+            delta=f"{sentiment_stats['negative']} posts"
+        )
+    
+    with col4:
+        active_workers = len([w for w in worker_status if w.get('status') == 'running'])
+        st.metric(
+            label="Active Workers",
+            value=active_workers,
+            delta=f"{len(worker_status)} total"
+        )
+    
+    st.markdown("---")
+    
+    # Charts Row
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if sum(sentiment_stats.values()) > 0:
+            fig_pie = create_sentiment_pie_chart(sentiment_stats)
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.info("No sentiment data available for the selected time range.")
+    
+    with col2:
+        if sum(platform_stats.values()) > 0:
+            fig_bar = create_platform_bar_chart(platform_stats)
+            st.plotly_chart(fig_bar, use_container_width=True)
+        else:
+            st.info("No platform data available for the selected time range.")
+    
+    # Timeline Chart
+    st.subheader("📈 Sentiment Trends")
+    if any(trends for trends in hourly_trends.values()):
+        fig_timeline = create_sentiment_timeline(hourly_trends)
+        st.plotly_chart(fig_timeline, use_container_width=True)
+    else:
+        st.info("No trend data available for the selected time range.")
+    
+    st.markdown("---")
+    
+    # Recent Posts Section
+    st.subheader("📝 Recent Posts")
+    
+    if recent_posts:
+        # Display count and filters
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col1:
+            st.write(f"Showing {len(recent_posts)} most recent posts")
+        
+        with col2:
+            platform_filter = st.selectbox(
+                "Filter by Platform",
+                options=["All"] + list(set(post.get('platform', '').title() for post in recent_posts)),
+                key="platform_filter"
             )
-            fig.update_layout(title="Sentiment Trends")
-            return fig
         
-        fig = go.Figure()
+        with col3:
+            sentiment_filter = st.selectbox(
+                "Filter by Sentiment",
+                options=["All"] + list(set(post.get('sentiment_label', '').title() for post in recent_posts)),
+                key="sentiment_filter"
+            )
         
-        # Add lines for each sentiment
-        fig.add_trace(go.Scatter(
-            x=df['hour'],
-            y=df['positive'],
-            mode='lines+markers',
-            name='Positive',
-            line=dict(color='#28a745', width=3),
-            marker=dict(size=6)
-        ))
+        # Apply filters
+        filtered_posts = recent_posts
+        if platform_filter != "All":
+            filtered_posts = [p for p in filtered_posts if p.get('platform', '').title() == platform_filter]
+        if sentiment_filter != "All":
+            filtered_posts = [p for p in filtered_posts if p.get('sentiment_label', '').title() == sentiment_filter]
         
-        fig.add_trace(go.Scatter(
-            x=df['hour'],
-            y=df['negative'],
-            mode='lines+markers',
-            name='Negative',
-            line=dict(color='#dc3545', width=3),
-            marker=dict(size=6)
-        ))
+        # Create and display table
+        if filtered_posts:
+            df = create_recent_posts_table(filtered_posts)
+            st.dataframe(df, use_container_width=True, height=400)
+            
+            # Download option
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"sentiment_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No posts match the selected filters.")
+    else:
+        st.info("No recent posts available.")
+    
+    st.markdown("---")
+    
+    # System Status
+    with st.expander("🔧 System Status", expanded=False):
+        if worker_status:
+            st.subheader("Worker Status")
+            
+            worker_df = pd.DataFrame(worker_status)
+            if not worker_df.empty:
+                # Clean up worker dataframe for display
+                display_cols = ['worker_id', 'status', 'processed_count', 'error_count', 'uptime', 'last_seen']
+                available_cols = [col for col in display_cols if col in worker_df.columns]
+                
+                if available_cols:
+                    st.dataframe(worker_df[available_cols], use_container_width=True)
+            
+            # Show available LLM providers
+            all_providers = set()
+            for worker in worker_status:
+                providers = worker.get('available_providers', [])
+                if isinstance(providers, list):
+                    all_providers.update(providers)
+            
+            if all_providers:
+                st.write("**Available LLM Providers:**")
+                st.write(", ".join(sorted(all_providers)))
+        else:
+            st.warning("No worker status information available.")
         
-        fig.add_trace(go.Scatter(
-            x
+        # Redis connection status
+        try:
+            redis_info = redis_client.info()
+            st.success(f"✅ Redis Connected - {redis_info.get('redis_version', 'Unknown version')}")
+        except Exception as e:
+            st.error(f"❌ Redis Connection Error: {e}")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"Auto-refresh: {'On' if auto_refresh else 'Off'}"
+    )
+    
+    # Auto-refresh logic
+    if auto_refresh:
+        time.sleep(refresh_rate)
+        st.experimental_rerun()
+
+
+if __name__ == "__main__":
+    main()

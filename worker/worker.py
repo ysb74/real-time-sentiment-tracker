@@ -1,433 +1,369 @@
-#!/usr/bin/env python3
 """
-Real-time Social Media Sentiment Tracker - Worker Service
+Sentiment Analysis Worker
 
-This service processes messages from the Redis queue, performs sentiment analysis
-using the Gemini API through the llm_service module, and stores the results
-for consumption by the dashboard service.
-
-The worker acts as the processing engine of our pipeline, handling:
-- Message queue consumption and management
-- Sentiment analysis orchestration
-- Result storage and caching
-- Error handling and recovery
-
-Author: Your Name
-Date: 2024
+This module consumes social media posts from RabbitMQ, performs sentiment analysis
+using LLMs, and stores results in Redis for real-time dashboard consumption.
 """
 
-import os
+import asyncio
 import json
-import time
 import logging
-import redis
+import os
+import signal
+import sys
+import time
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from llm_service import SentimentAnalyzer
+from typing import Dict, Any, Optional
 
-# Load environment variables from .env file
-load_dotenv()
+import pika
+import redis
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings
+import structlog
 
-# Configure logging for monitoring and debugging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from .llm_service import LLMSentimentService, SentimentResult
+
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        structlog.processors.JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
 )
-logger = logging.getLogger(__name__)
+
+logger = structlog.get_logger()
+
+
+class Settings(BaseSettings):
+    """Worker settings"""
+    rabbitmq_url: str = "amqp://admin:password@localhost:5672/"
+    redis_url: str = "redis://localhost:6379/0"
+    
+    # LLM API keys
+    openai_api_key: Optional[str] = None
+    huggingface_api_key: Optional[str] = None
+    
+    # Processing configuration
+    max_concurrent_tasks: int = 10
+    batch_size: int = 5
+    processing_timeout: int = 30
+    
+    # Data retention
+    sentiment_data_retention_hours: int = 24
+    
+    class Config:
+        env_file = ".env"
+
+
+class ProcessedPost(BaseModel):
+    """Processed social media post with sentiment"""
+    # Original post data
+    id: str
+    platform: str
+    content: str
+    author: str
+    created_at: datetime
+    url: Optional[str] = None
+    metrics: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}
+    
+    # Sentiment analysis results
+    sentiment_label: str
+    sentiment_confidence: float
+    sentiment_reasoning: Optional[str] = None
+    model_used: str
+    processing_time: float
+    processed_at: datetime
+
 
 class SentimentWorker:
-    """
-    A worker service that processes Reddit posts from a message queue
-    and performs sentiment analysis using AI.
-    
-    This class handles:
-    1. Redis queue consumption
-    2. Message parsing and validation
-    3. Sentiment analysis coordination
-    4. Result storage and management
-    5. Error handling and recovery
-    """
+    """Worker that processes social media posts for sentiment analysis"""
     
     def __init__(self):
-        """
-        Initialize the sentiment worker with Redis connection and AI analyzer.
+        self.settings = Settings()
+        self.running = False
+        self.connection = None
+        self.channel = None
+        self.redis_client = redis.from_url(self.settings.redis_url)
         
-        Sets up all necessary connections and validates configuration.
-        """
-        # Load configuration from environment variables
-        self.redis_host = os.getenv('REDIS_HOST', 'localhost')
-        self.redis_port = int(os.getenv('REDIS_PORT', 6379))
-        self.redis_db = int(os.getenv('REDIS_DB', 0))
+        # Initialize LLM service
+        self.llm_service = LLMSentimentService(
+            openai_api_key=self.settings.openai_api_key,
+            huggingface_api_key=self.settings.huggingface_api_key
+        )
         
-        # Processing configuration
-        self.batch_size = int(os.getenv('WORKER_BATCH_SIZE', 1))
-        self.processing_timeout = int(os.getenv('WORKER_TIMEOUT', 30))
+        # Processing statistics
+        self.stats = {
+            "processed_count": 0,
+            "error_count": 0,
+            "start_time": time.time(),
+            "last_processed": None
+        }
         
-        # Initialize connections
-        self.redis_client = self._setup_redis_connection()
-        self.sentiment_analyzer = self._setup_sentiment_analyzer()
-        
-        # Performance tracking
-        self.processed_count = 0
-        self.error_count = 0
-        self.start_time = datetime.utcnow()
-        
-        logger.info("Sentiment Worker initialized successfully")
-    
-    def _setup_redis_connection(self):
-        """
-        Create and test the Redis connection for message queue operations.
-        
-        Returns:
-            redis.Redis: Connected Redis client instance
-        """
+    def setup_rabbitmq_connection(self):
+        """Setup RabbitMQ connection and channel"""
         try:
-            redis_client = redis.Redis(
-                host=self.redis_host,
-                port=self.redis_port,
-                db=self.redis_db,
-                decode_responses=True
-            )
+            self.connection = pika.BlockingConnection(pika.URLParameters(self.settings.rabbitmq_url))
+            self.channel = self.connection.channel()
             
-            # Test the connection
-            redis_client.ping()
-            logger.info(f"Connected to Redis at {self.redis_host}:{self.redis_port}")
-            return redis_client
+            # Ensure queue exists
+            self.channel.queue_declare(queue='sentiment_analysis', durable=True)
+            
+            # Set QoS to process messages one at a time for load balancing
+            self.channel.basic_qos(prefetch_count=1)
+            
+            logger.info("RabbitMQ connection established")
             
         except Exception as e:
-            logger.error(f"Failed to connect to Redis: {str(e)}")
+            logger.error("Failed to connect to RabbitMQ", error=str(e))
             raise
     
-    def _setup_sentiment_analyzer(self):
-        """
-        Initialize the sentiment analysis service.
-        
-        Returns:
-            SentimentAnalyzer: Configured sentiment analyzer instance
-        """
+    async def process_message(self, ch, method, properties, body):
+        """Process a single message from the queue"""
         try:
-            analyzer = SentimentAnalyzer()
-            logger.info("Sentiment analyzer initialized successfully")
-            return analyzer
+            # Parse message
+            message_data = json.loads(body.decode('utf-8'))
+            post_id = message_data.get('id', 'unknown')
             
-        except Exception as e:
-            logger.error(f"Failed to initialize sentiment analyzer: {str(e)}")
-            raise
-    
-    def _parse_message(self, message: str) -> dict:
-        """
-        Parse and validate a JSON message from the queue.
-        
-        This method handles message deserialization and validates that
-        the message contains all required fields for processing.
-        
-        Args:
-            message (str): JSON string from Redis queue
+            logger.info("Processing message", post_id=post_id, platform=message_data.get('platform'))
             
-        Returns:
-            dict: Parsed message data, or None if invalid
-        """
-        try:
-            data = json.loads(message)
-            
-            # Validate required fields
-            required_fields = ['id', 'title', 'content', 'subreddit']
-            missing_fields = [field for field in required_fields if field not in data]
-            
-            if missing_fields:
-                logger.warning(f"Message missing required fields: {missing_fields}")
-                return None
-            
-            # Ensure content is not empty
-            if not data.get('content', '').strip():
-                logger.warning(f"Message {data.get('id', 'unknown')} has empty content")
-                return None
-            
-            return data
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON message: {str(e)}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error parsing message: {str(e)}")
-            return None
-    
-    def _process_post(self, post_data: dict) -> dict:
-        """
-        Process a single post through sentiment analysis.
-        
-        This method coordinates the sentiment analysis process and
-        combines the original post data with the analysis results.
-        
-        Args:
-            post_data (dict): Original post data from ingestor
-            
-        Returns:
-            dict: Combined post data with sentiment analysis results
-        """
-        try:
-            # Extract text content for analysis
-            content = post_data['content']
+            # Extract content for sentiment analysis
+            content = message_data.get('content', '')
+            if not content or len(content.strip()) < 5:
+                logger.warning("Skipping message with insufficient content", post_id=post_id)
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
             
             # Perform sentiment analysis
-            logger.info(f"Analyzing sentiment for post: {post_data['id']}")
-            sentiment_result = self.sentiment_analyzer.analyze_sentiment(content)
+            start_time = time.time()
+            sentiment_result = await self.llm_service.analyze_sentiment(content)
             
-            # Combine original data with sentiment results  
-            processed_data = {
-                **post_data,  # Original post data
-                'sentiment_analysis': sentiment_result,
-                'processed_timestamp': datetime.utcnow().isoformat(),
-                'processing_duration': sentiment_result.get('processing_time', 0)
-            }
-            
-            # Add convenience fields for dashboard
-            processed_data['sentiment'] = sentiment_result.get('sentiment', 'neutral')
-            processed_data['confidence'] = sentiment_result.get('confidence', 0)
-            processed_data['sentiment_reason'] = sentiment_result.get('reason', 'unknown')
-            
-            logger.info(f"Successfully processed post {post_data['id']}: "
-                       f"{processed_data['sentiment']} ({processed_data['confidence']}%)")
-            
-            return processed_data
-            
-        except Exception as e:
-            logger.error(f"Error processing post {post_data.get('id', 'unknown')}: {str(e)}")
-            
-            # Return post with error information
-            return {
-                **post_data,
-                'sentiment_analysis': {
-                    'sentiment': 'neutral',
-                    'confidence': 0,
-                    'reason': 'processing error',
-                    'error': str(e)
-                },
-                'sentiment': 'neutral',
-                'confidence': 0,
-                'sentiment_reason': 'processing error',
-                'processed_timestamp': datetime.utcnow().isoformat(),
-                'processing_error': True
-            }
-    
-    def _store_result(self, processed_data: dict):
-        """
-        Store processed results in Redis for dashboard consumption.
-        
-        This method handles multiple storage patterns:
-        1. Individual post storage with expiration
-        2. Aggregate data for dashboard displays
-        3. Recent posts list for real-time updates
-        
-        Args:
-            processed_data (dict): Processed post with sentiment analysis
-        """
-        try:
-            post_id = processed_data['id']
-            
-            # Store individual post data (expires after 24 hours)
-            self.redis_client.hset(
-                f"post:{post_id}",
-                mapping=processed_data
+            # Create processed post object
+            processed_post = ProcessedPost(
+                # Original data
+                id=message_data['id'],
+                platform=message_data['platform'],
+                content=content,
+                author=message_data.get('author', 'unknown'),
+                created_at=datetime.fromisoformat(message_data['created_at'].replace('Z', '+00:00')),
+                url=message_data.get('url'),
+                metrics=message_data.get('metrics', {}),
+                metadata=message_data.get('metadata', {}),
+                
+                # Sentiment data
+                sentiment_label=sentiment_result.label.value,
+                sentiment_confidence=sentiment_result.confidence,
+                sentiment_reasoning=sentiment_result.reasoning,
+                model_used=sentiment_result.model_used,
+                processing_time=sentiment_result.processing_time,
+                processed_at=datetime.utcnow()
             )
-            self.redis_client.expire(f"post:{post_id}", 86400)  # 24 hours
             
-            # Add to recent posts list (for dashboard table)
-            recent_posts_data = {
-                'id': post_id,
-                'title': processed_data['title'][:100],  # Truncate long titles
-                'subreddit': processed_data['subreddit'],
-                'sentiment': processed_data['sentiment'],
-                'confidence': processed_data['confidence'],
-                'timestamp': processed_data['processed_timestamp'],
-                'permalink': processed_data.get('permalink', ''),
-                'score': processed_data.get('score', 0)
+            # Store results in Redis
+            await self.store_sentiment_result(processed_post)
+            
+            # Update statistics
+            self.stats["processed_count"] += 1
+            self.stats["last_processed"] = time.time()
+            
+            # Acknowledge message
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            
+            logger.info("Message processed successfully", 
+                       post_id=post_id,
+                       sentiment=sentiment_result.label.value,
+                       confidence=sentiment_result.confidence,
+                       processing_time=sentiment_result.processing_time)
+            
+        except json.JSONDecodeError as e:
+            logger.error("Invalid JSON in message", error=str(e))
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # Don't requeue invalid messages
+            self.stats["error_count"] += 1
+            
+        except Exception as e:
+            logger.error("Error processing message", error=str(e))
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)  # Requeue for retry
+            self.stats["error_count"] += 1
+    
+    async def store_sentiment_result(self, processed_post: ProcessedPost):
+        """Store sentiment analysis result in Redis"""
+        try:
+            # Store individual post data
+            post_key = f"sentiment:post:{processed_post.id}"
+            post_data = processed_post.model_dump(mode='json')
+            
+            # Convert datetime objects to ISO strings for JSON serialization
+            for key, value in post_data.items():
+                if isinstance(value, datetime):
+                    post_data[key] = value.isoformat()
+            
+            # Store with expiration
+            expiration_seconds = self.settings.sentiment_data_retention_hours * 3600
+            self.redis_client.setex(post_key, expiration_seconds, json.dumps(post_data))
+            
+            # Add to platform-specific sorted sets for time-based queries
+            platform_key = f"sentiment:platform:{processed_post.platform}"
+            timestamp = processed_post.processed_at.timestamp()
+            self.redis_client.zadd(platform_key, {processed_post.id: timestamp})
+            
+            # Add to sentiment-specific sorted sets
+            sentiment_key = f"sentiment:label:{processed_post.sentiment_label}"
+            self.redis_client.zadd(sentiment_key, {processed_post.id: timestamp})
+            
+            # Update real-time statistics
+            current_hour = datetime.utcnow().strftime("%Y-%m-%d:%H")
+            stats_key = f"sentiment:stats:{current_hour}"
+            
+            pipe = self.redis_client.pipeline()
+            pipe.hincrby(stats_key, f"total", 1)
+            pipe.hincrby(stats_key, f"platform:{processed_post.platform}", 1)
+            pipe.hincrby(stats_key, f"sentiment:{processed_post.sentiment_label}", 1)
+            pipe.expire(stats_key, expiration_seconds)
+            pipe.execute()
+            
+            # Update recent posts list for dashboard
+            recent_key = "sentiment:recent"
+            self.redis_client.lpush(recent_key, processed_post.id)
+            self.redis_client.ltrim(recent_key, 0, 99)  # Keep only last 100 posts
+            
+            logger.debug("Sentiment result stored", 
+                        post_id=processed_post.id,
+                        platform=processed_post.platform,
+                        sentiment=processed_post.sentiment_label)
+            
+        except Exception as e:
+            logger.error("Failed to store sentiment result", error=str(e), post_id=processed_post.id)
+    
+    def cleanup_expired_data(self):
+        """Clean up expired data from Redis"""
+        try:
+            cutoff_time = datetime.utcnow() - timedelta(hours=self.settings.sentiment_data_retention_hours)
+            cutoff_timestamp = cutoff_time.timestamp()
+            
+            # Clean up sorted sets
+            for key_pattern in ["sentiment:platform:*", "sentiment:label:*"]:
+                for key in self.redis_client.scan_iter(match=key_pattern):
+                    self.redis_client.zremrangebyscore(key, 0, cutoff_timestamp)
+            
+            logger.debug("Expired data cleanup completed", cutoff_time=cutoff_time.isoformat())
+            
+        except Exception as e:
+            logger.error("Error during data cleanup", error=str(e))
+    
+    def update_worker_status(self):
+        """Update worker status in Redis"""
+        try:
+            status_data = {
+                "worker_id": os.getenv("HOSTNAME", "worker-1"),
+                "status": "running" if self.running else "stopped",
+                "processed_count": self.stats["processed_count"],
+                "error_count": self.stats["error_count"],
+                "uptime": time.time() - self.stats["start_time"],
+                "last_seen": datetime.utcnow().isoformat(),
+                "available_providers": self.llm_service.get_available_providers()
             }
             
-            # Push to recent posts list and limit size
-            self.redis_client.lpush('recent_posts', json.dumps(recent_posts_data))
-            self.redis_client.ltrim('recent_posts', 0, 199)  # Keep last 200 posts
-            
-            # Update aggregate statistics
-            self._update_statistics(processed_data)
-            
-            logger.debug(f"Stored results for post {post_id}")
+            worker_key = f"worker:status:{status_data['worker_id']}"
+            self.redis_client.hset(worker_key, mapping=status_data)
+            self.redis_client.expire(worker_key, 300)  # 5 minutes expiration
             
         except Exception as e:
-            logger.error(f"Failed to store results for post {processed_data.get('id', 'unknown')}: {str(e)}")
+            logger.error("Failed to update worker status", error=str(e))
     
-    def _update_statistics(self, processed_data: dict):
-        """
-        Update aggregate statistics for dashboard displays.
-        
-        This method maintains running totals and recent sentiment trends
-        that are used by the dashboard for real-time visualization.
-        
-        Args:
-            processed_data (dict): Processed post with sentiment analysis
-        """
-        try:
-            sentiment = processed_data['sentiment']
-            confidence = processed_data['confidence']
-            timestamp = processed_data['processed_timestamp']
-            
-            # Increment sentiment counters
-            self.redis_client.hincrby('sentiment_stats', f'{sentiment}_count', 1)
-            self.redis_client.hincrby('sentiment_stats', 'total_count', 1)
-            
-            # Update confidence tracking
-            current_avg = float(self.redis_client.hget('sentiment_stats', 'avg_confidence') or 0)
-            total_count = int(self.redis_client.hget('sentiment_stats', 'total_count') or 1)
-            
-            # Calculate new rolling average
-            new_avg = ((current_avg * (total_count - 1)) + confidence) / total_count
-            self.redis_client.hset('sentiment_stats', 'avg_confidence', round(new_avg, 2))
-            
-            # Add to time series data for trend charts (last 24 hours)
-            hour_key = datetime.fromisoformat(timestamp.replace('Z', '')).strftime('%Y-%m-%d-%H')
-            self.redis_client.hincrby(f'hourly_sentiment:{hour_key}', sentiment, 1)
-            self.redis_client.expire(f'hourly_sentiment:{hour_key}', 86400)  # 24 hour expiry
-            
-            # Update last processed timestamp
-            self.redis_client.hset('sentiment_stats', 'last_updated', timestamp)
-            
-        except Exception as e:
-            logger.error(f"Failed to update statistics: {str(e)}")
+    def setup_signal_handlers(self):
+        """Setup graceful shutdown handlers"""
+        def signal_handler(signum, frame):
+            logger.info("Shutdown signal received", signal=signum)
+            self.running = False
+            if self.connection and not self.connection.is_closed:
+                self.connection.close()
+                
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
     
-    def _get_queue_message(self, timeout: int = 1) -> str:
-        """
-        Get the next message from the Redis queue with timeout.
+    async def start_processing(self):
+        """Start processing messages from the queue"""
+        self.running = True
+        self.setup_signal_handlers()
         
-        This method handles queue operations with proper timeout handling
-        to prevent the worker from blocking indefinitely.
+        logger.info("Starting sentiment analysis worker",
+                   available_providers=self.llm_service.get_available_providers())
         
-        Args:
-            timeout (int): Timeout in seconds for queue operations
-            
-        Returns:
-            str: Message from queue, or None if timeout/empty
-        """
-        try:
-            # Use BRPOP for blocking pop with timeout
-            result = self.redis_client.brpop('reddit_posts', timeout=timeout)
-            
-            if result:
-                queue_name, message = result
-                return message
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error getting message from queue: {str(e)}")
-            return None
-    
-    def _log_performance_stats(self):
-        """
-        Log performance statistics for monitoring.
+        # Setup RabbitMQ connection
+        self.setup_rabbitmq_connection()
         
-        This method provides periodic performance updates that help
-        with monitoring and optimization of the worker service.
-        """
-        uptime = datetime.utcnow() - self.start_time
-        rate = self.processed_count / uptime.total_seconds() if uptime.total_seconds() > 0 else 0
-        error_rate = (self.error_count / self.processed_count * 100) if self.processed_count > 0 else 0
-        
-        logger.info(f"Performance Stats - Processed: {self.processed_count}, "
-                   f"Errors: {self.error_count}, Rate: {rate:.2f}/sec, "
-                   f"Error Rate: {error_rate:.1f}%, Uptime: {uptime}")
-    
-    def start_processing(self):
-        """
-        Start the main processing loop.
-        
-        This is the main method that runs continuously, processing messages
-        from the queue and coordinating sentiment analysis. It includes
-        comprehensive error handling and performance monitoring.
-        """
-        logger.info("Starting sentiment processing worker...")
-        
-        last_stats_log = datetime.utcnow()
-        stats_interval = timedelta(minutes=5)  # Log stats every 5 minutes
-        
-        while True:
+        # Create async wrapper for message processing
+        def callback_wrapper(ch, method, properties, body):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                # Get message from queue with timeout
-                message = self._get_queue_message(timeout=5)
-                
-                if message:
-                    # Parse the message
-                    post_data = self._parse_message(message)
-                    
-                    if post_data:
-                        # Process the post
-                        start_time = time.time()
-                        processed_data = self._process_post(post_data)
-                        processing_time = time.time() - start_time
-                        
-                        # Store the results
-                        self._store_result(processed_data)
-                        
-                        # Update counters
-                        self.processed_count += 1
-                        
-                        if processed_data.get('processing_error'):
-                            self.error_count += 1
-                        
-                        logger.debug(f"Processed post in {processing_time:.2f}s")
-                        
-                    else:
-                        logger.warning("Skipped invalid message")
-                        self.error_count += 1
-                
-                else:
-                    # No message received (timeout) - this is normal
-                    logger.debug("No messages in queue, waiting...")
-                
-                # Periodic performance logging
-                if datetime.utcnow() - last_stats_log > stats_interval:
-                    self._log_performance_stats()
-                    last_stats_log = datetime.utcnow()
-                    
-            except KeyboardInterrupt:
-                logger.info("Worker stopped by user")
-                break
-                
-            except Exception as e:
-                logger.error(f"Unexpected error in processing loop: {str(e)}")
-                self.error_count += 1
-                
-                # Brief pause to prevent tight error loops
-                time.sleep(5)
-                
-                # Attempt to reconnect services
-                try:
-                    self.redis_client = self._setup_redis_connection()
-                    self.sentiment_analyzer = self._setup_sentiment_analyzer()
-                except Exception as reconnect_error:
-                    logger.error(f"Reconnection failed: {str(reconnect_error)}")
-                    time.sleep(30)  # Longer pause on reconnection failure
+                loop.run_until_complete(self.process_message(ch, method, properties, body))
+            finally:
+                loop.close()
         
-        # Final performance stats
-        self._log_performance_stats()
-        logger.info("Sentiment processing worker stopped")
+        # Start consuming messages
+        self.channel.basic_consume(
+            queue='sentiment_analysis',
+            on_message_callback=callback_wrapper
+        )
+        
+        logger.info("Worker ready, waiting for messages")
+        
+        # Main processing loop
+        last_cleanup = time.time()
+        last_status_update = time.time()
+        
+        try:
+            while self.running:
+                # Process messages (non-blocking)
+                self.connection.process_data_events(time_limit=1)
+                
+                # Periodic maintenance tasks
+                current_time = time.time()
+                
+                # Cleanup expired data every hour
+                if current_time - last_cleanup > 3600:
+                    self.cleanup_expired_data()
+                    last_cleanup = current_time
+                
+                # Update worker status every 30 seconds
+                if current_time - last_status_update > 30:
+                    self.update_worker_status()
+                    last_status_update = current_time
+                
+                await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
+                
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt")
+        except Exception as e:
+            logger.error("Worker error", error=str(e))
+        finally:
+            # Cleanup
+            if self.connection and not self.connection.is_closed:
+                self.connection.close()
+            
+            self.update_worker_status()
+            logger.info("Worker stopped", 
+                       processed_count=self.stats["processed_count"],
+                       error_count=self.stats["error_count"])
 
-def main():
-    """
-    Main entry point for the worker service.
-    
-    This function initializes the worker and starts the processing loop.
-    It's designed to run continuously as a service.
-    """
-    try:
-        logger.info("Starting Sentiment Worker Service...")
-        worker = SentimentWorker()
-        worker.start_processing()
-        
-    except KeyboardInterrupt:
-        logger.info("Worker service stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error in worker service: {str(e)}")
-        raise
+
+async def main():
+    """Main entry point"""
+    worker = SentimentWorker()
+    await worker.start_processing()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
