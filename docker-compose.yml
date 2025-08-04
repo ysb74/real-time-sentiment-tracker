@@ -29,15 +29,69 @@ services:
       interval:  30s
       timeout:  10s
       retries:  3
+  # Social Media Data Ingestor
   ingestor:
     build: .
     container_name: sentiment_ingestor
     environment:
-      - RABBITMQ_URL=amgq://admin:password@rabbitmq:5672/
+      - RABBITMQ_URL=amqp://admin:password@rabbitmq:5672/
       - REDIS_URL=redis://redis:6379/0
       - TWITTER_BEARER_TOKEN=${TWITTER_BEARER_TOKEN}
       - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
       - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
       - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
     command: python ingestor/ingestor.py
-    
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  # Sentiment Analysis Worker
+  worker:
+    build: .
+    container_name: sentiment_worker
+    environment:
+      - RABBITMQ_URL=amqp://admin:password@rabbitmq:5672/
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY}
+    command: python worker/worker.py
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      replicas: 2
+
+  # Real-time Dashboard
+  dashboard:
+    build: .
+    container_name: sentiment_dashboard
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://admin:password@rabbitmq:5672/
+    ports:
+      - "8501:8501"
+    command: python -m streamlit run dashboard/dashboard.py --server.address 0.0.0.0 --server.port 8501
+    depends_on:
+      - redis
+      - rabbitmq
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  rabbitmq_data:
+  redis_data:
+
+networks:
+  default:
+    name: sentiment_network
