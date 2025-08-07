@@ -87,6 +87,22 @@ services:
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
+    
+  alerts:
+    build: .
+    container_name: sentiment_alerts
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - ALERT_EMAIL_FROM=alerts@yourdomain.com
+      - ALERT_EMAIL_TO=ops@yourdomain.com
+      - SMTP_SERVER=smtp.yourdomain.com
+      - SMTP_USER=alerts@yourdomain.com
+      - SMTP_PASS=secret
+      - SLACK_WEBHOOK_URL=your_slack_url
+    command: python alerts/monitor.py
+    depends_on:
+      - redis
+
 
 volumes:
   rabbitmq_data:
