@@ -1,0 +1,11 @@
+ymaml
+
+rules:
+  - name: "High negative sentiment detected"
+    sentiment: "negative"
+    threshold: 10
+    window: 5
+    platforms: ['twitter',"reddit"]
+    channels: ["email","slack"]
+    message: |
+          high negative sentiment! {count} negative posts in last {window} minutes.
