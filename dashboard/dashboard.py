@@ -137,6 +137,32 @@ class DashboardData:
         except Exception as e:
             logger.error("Error fetching hourly trends", error=str(e))
             return {"positive": [], "negative": [], "neutral": []}
+
+    def search_posts(self, keywords=None, sentiment=None, platform=None, since=None, until=None, modality=None):
+        # keywords: list, sentiment: str/list, platform:str/list, since/until datetime
+        posts = self.get_recent_posts(200)
+        # Filtering logic
+        if keywords:
+            posts = [p for p in posts if any(kw.lower() in p['content'].lower() for kw in keywords)]
+        if sentiment:
+            if isinstance(sentiment, str): sentiment = [sentiment]
+            posts = [p for p in posts if p.get("sentiment_label") in sentiment]
+        if platform:
+            if isinstance(platform, str): platform = [platform]
+            posts = [p for p in posts if p.get("platform") in platform]
+        # Date filtering
+        if since or until:
+            def in_range(p):
+                ts = datetime.fromisoformat(p.get("processed_at"))
+                if since and ts < since: return False
+                if until and ts > until: return False
+                return True
+            posts = [p for p in posts if in_range(p)]
+        if modality:
+            posts = [p for p in posts if p.get(modality)]
+        return posts
+
+    
     
     def get_worker_status(self) -> List[Dict[str, Any]]:
         """Get status of all workers"""
@@ -286,7 +312,25 @@ def main():
     st.markdown("---")
     
     # Sidebar configuration
-    st.sidebar.header("Configuration")
+    st.sidebar.header("Advanced Search & Filter") # **Usability Add**
+    search_query = st.sidebar.text_input("Search keywords")
+    search_modality = st.sidebar.selectbox("Modality", ["All", "text", "image", "audio"])
+    search_sentiment = st.sidebar.selectbox("Sentiment", ["All", "positive", "negative", "neutral"])
+    search_platform = st.sidebar.selectbox("Platform", ["All", "twitter", "reddit"])
+    from_dt = st.sidebar.date_input("From date")
+    to_dt = st.sidebar.date_input("To date")
+
+if st.sidebar.button("Apply Filters"):
+    results = data_handler.search_posts(
+        keywords=[search_query] if search_query else None,
+        modality=None if search_modality == "All" else search_modality,
+        sentiment=None if search_sentiment == "All" else search_sentiment,
+        platform=None if search_platform == "All" else search_platform,
+        since=datetime.combine(from_dt, datetime.min.time()) if from_dt else None,
+        until=datetime.combine(to_dt, datetime.max.time()) if to_dt else None
+    )
+    # Display these results (as table, charts etc)
+
     
     # Time range selector
     time_range = st.sidebar.selectbox(
@@ -376,6 +420,16 @@ def main():
         st.info("No trend data available for the selected time range.")
     
     st.markdown("---")
+
+    st.subheader("Real-Time Alerts")
+    alerts_list = data_handler.redis.lrange("alerts:recent", 0, 9)  # store recent triggered alerts as Redis list in monitor.py
+    if alerts_list:
+        for alert_json in alerts_list:
+            alert = json.loads(alert_json)
+            st.error(f"🔔 {alert['time']}: {alert['message']}")
+    else:
+        st.success("No critical alerts in last hour.")
+
     
     # Recent Posts Section
     st.subheader("📝 Recent Posts")
