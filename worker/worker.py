@@ -44,6 +44,25 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
+from multimodal.image import ImageSentimentAnalyzer
+from multimodal.audio import AudioSentimentAnalyzer
+from multimodal.fusion import fuse_modalities
+
+# Inside your worker's processing routine, add:
+def process_post(post):
+    results = {}
+    # Assume post dict has keys: text, image_url, audio_url
+    if post.get("text"):
+        results["text"] = analyze_text_sentiment(post["text"])  # Use existing LLM service
+    if post.get("image_url"):
+        img_analyzer = ImageSentimentAnalyzer()
+        results["image"] = img_analyzer.analyze(post["image_url"])
+    if post.get("audio_url"):
+        aud_analyzer = AudioSentimentAnalyzer()
+        results["audio"] = aud_analyzer.analyze(post["audio_url"])
+    fused = fuse_modalities(results)
+    return fused, results
+
 
 class Settings(BaseSettings):
     """Worker settings"""
