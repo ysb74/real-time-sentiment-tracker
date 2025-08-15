@@ -32,9 +32,9 @@ real-time-sentiment-tracker/
 │   └── ingestor.py
 ├── multimodal/
 │   ├── __init__.py
-│   ├── image.py          # Image feature extraction & sentiment
-│   ├── audio.py          # Audio-to-text & audio sentiment/emotion
-│   └── fusion.py         # Fusion logic for multimodal aggregation
+│   ├── image.py
+│   ├── audio.py
+│   └── fusion.py
 ├── worker/
 │   ├── __init__.py
 │   ├── worker.py
@@ -42,9 +42,16 @@ real-time-sentiment-tracker/
 ├── dashboard/
 │   ├── __init__.py
 │   └── dashboard.py
-└── utils/
-    ├── __init__.py
-    └── helpers.py        # Common utility functions
+├── alerts/                 # <-- NEW (Automated Alerts)
+│   ├── __init__.py
+│   ├── rules.py            # Alert rule logic
+│   ├── dispatcher.py       # Notification sending (email, Slack, etc.)
+│   └── monitor.py          # Alert event monitor/trigger
+├── utils/
+│   ├── __init__.py
+│   └── helpers.py
+└── config/
+    └── alert_rules.yaml  
 ```
     
 # Real-time Social Media Sentiment Tracker
