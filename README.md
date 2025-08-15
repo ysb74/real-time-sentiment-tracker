@@ -18,6 +18,35 @@ This project demonstrates a microservices architecture with the following compon
 └─────────────┘    └─────────────┘                    └─────────────┘
 
 ```
+
+## Project Structure
+```
+real-time-sentiment-tracker/
+├── .gitignore
+├── Dockerfile
+├── docker-compose.yml
+├── README.md
+├── requirements.txt
+├── ingestor/
+│   ├── __init__.py
+│   └── ingestor.py
+├── multimodal/
+│   ├── __init__.py
+│   ├── image.py          # Image feature extraction & sentiment
+│   ├── audio.py          # Audio-to-text & audio sentiment/emotion
+│   └── fusion.py         # Fusion logic for multimodal aggregation
+├── worker/
+│   ├── __init__.py
+│   ├── worker.py
+│   └── llm_service.py
+├── dashboard/
+│   ├── __init__.py
+│   └── dashboard.py
+└── utils/
+    ├── __init__.py
+    └── helpers.py        # Common utility functions
+```
+    
 # Real-time Social Media Sentiment Tracker
 
 A comprehensive real-time sentiment analysis system that monitors social media platforms, processes content through Large Language Models (LLMs), and provides live visualization through an interactive dashboard.
